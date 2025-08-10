@@ -1,0 +1,126 @@
+# Render deployment configuration
+services:
+  # Web Service (FastAPI)
+  - type: web
+    name: aurea-orchestrator-api
+    runtime: docker
+    dockerfilePath: ./infra/Dockerfile.api
+    dockerContext: .
+    envVars:
+      - key: ENV
+        value: production
+      - key: PORT
+        value: 8000
+      - key: SENTRY_DSN
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: REDIS_TLS
+        value: "true"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: API_KEY
+        generateValue: true
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: INTERNAL_KEY
+        generateValue: true
+      - key: GITHUB_APP_ID
+        sync: false
+      - key: GITHUB_INSTALLATION_ID
+        sync: false
+      - key: GITHUB_PRIVATE_KEY_BASE64
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: CENTERPOINT_BASE_URL
+        value: https://api.centerpointconnect.io
+      - key: CENTERPOINT_BEARER_TOKEN
+        sync: false
+      - key: CENTERPOINT_TENANT_ID
+        sync: false
+      - key: MRG_PRODUCTION_WEBHOOK
+        value: https://api.render.com/deploy/srv-d1tfs4idbo4c73di6k00?key=t2qc-8j6xrM
+    healthCheckPath: /health
+    autoDeploy: true
+    plan: standard
+
+  # Background Worker
+  - type: worker
+    name: aurea-orchestrator-worker
+    runtime: docker
+    dockerfilePath: ./infra/Dockerfile.worker
+    dockerContext: .
+    envVars:
+      - key: ENV
+        value: production
+      - key: WORKER_ID
+        value: aurea-worker-prod-01
+      - key: SENTRY_DSN
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: REDIS_TLS
+        value: "true"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: MAX_CONCURRENCY
+        value: "8"
+      - key: TASK_LEASE_SECONDS
+        value: "900"
+      - key: TASK_MAX_RETRIES
+        value: "6"
+      - key: TASK_BACKOFF_MAX_SEC
+        value: "60"
+      - key: MODEL_DAILY_BUDGET_USD
+        value: "25"
+      - key: GITHUB_APP_ID
+        sync: false
+      - key: GITHUB_INSTALLATION_ID
+        sync: false
+      - key: GITHUB_PRIVATE_KEY_BASE64
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CENTERPOINT_BASE_URL
+        value: https://api.centerpointconnect.io
+      - key: CENTERPOINT_BEARER_TOKEN
+        sync: false
+      - key: CENTERPOINT_TENANT_ID
+        sync: false
+    autoDeploy: true
+    plan: standard
+    
+  # Cron Job for maintenance
+  - type: cron
+    name: aurea-orchestrator-maintenance
+    schedule: "0 2 * * *"  # Daily at 2 AM UTC
+    buildCommand: "pip install httpx"
+    startCommand: |
+      python -c "
+      import httpx
+      import os
+      
+      response = httpx.post(
+          f\"https://aurea-orchestrator-api.onrender.com/internal/maintenance\",
+          headers={'X-Internal-Key': os.getenv('INTERNAL_KEY')}
+      )
+      print(f'Maintenance task: {response.status_code}')
+      "
+    envVars:
+      - key: INTERNAL_KEY
+        sync: false
