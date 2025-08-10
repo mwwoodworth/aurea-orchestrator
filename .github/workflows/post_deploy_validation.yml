@@ -1,0 +1,267 @@
+name: Post-Deploy Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to validate'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+  
+  # Trigger after deployment workflows
+  workflow_run:
+    workflows: ["Deploy to Render"]
+    types:
+      - completed
+
+env:
+  STAGING_URL: https://aurea-orchestrator-api-staging.onrender.com
+  PRODUCTION_URL: https://aurea-orchestrator-api.onrender.com
+
+jobs:
+  smoke-tests:
+    name: Run Smoke Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set environment URL
+        id: set-url
+        run: |
+          if [[ "${{ github.event.inputs.environment || 'staging' }}" == "production" ]]; then
+            echo "api_url=${{ env.PRODUCTION_URL }}" >> $GITHUB_OUTPUT
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "api_url=${{ env.STAGING_URL }}" >> $GITHUB_OUTPUT
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Wait for service to be ready
+        run: |
+          echo "Waiting for ${{ steps.set-url.outputs.api_url }} to be ready..."
+          for i in {1..30}; do
+            if curl -f "${{ steps.set-url.outputs.api_url }}/health" > /dev/null 2>&1; then
+              echo "Service is ready!"
+              break
+            fi
+            echo "Attempt $i/30 failed, waiting 10s..."
+            sleep 10
+          done
+          
+      - name: Check health endpoint
+        id: health-check
+        run: |
+          response=$(curl -s -w "\n%{http_code}" "${{ steps.set-url.outputs.api_url }}/health")
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+          
+          echo "HTTP Code: $http_code"
+          echo "Response: $body"
+          
+          if [[ "$http_code" != "200" ]]; then
+            echo "Health check failed!"
+            exit 1
+          fi
+          
+          echo "health_status=healthy" >> $GITHUB_OUTPUT
+          
+      - name: Check metrics endpoint
+        id: metrics-check
+        run: |
+          response=$(curl -s -w "\n%{http_code}" "${{ steps.set-url.outputs.api_url }}/metrics")
+          http_code=$(echo "$response" | tail -n1)
+          
+          if [[ "$http_code" != "200" ]]; then
+            echo "Metrics endpoint failed!"
+            exit 1
+          fi
+          
+          # Check for required metrics
+          metrics=$(echo "$response" | head -n-1)
+          
+          required_metrics=(
+            "aurea_up"
+            "aurea_queue_depth"
+            "aurea_throughput_fph"
+            "aurea_slo_latency_met"
+          )
+          
+          for metric in "${required_metrics[@]}"; do
+            if ! echo "$metrics" | grep -q "$metric"; then
+              echo "Missing required metric: $metric"
+              exit 1
+            fi
+          done
+          
+          echo "metrics_status=available" >> $GITHUB_OUTPUT
+          
+      - name: Check dependencies health
+        id: deps-check
+        run: |
+          response=$(curl -s "${{ steps.set-url.outputs.api_url }}/internal/health/deps")
+          
+          # Parse JSON response
+          status=$(echo "$response" | jq -r '.status')
+          postgres=$(echo "$response" | jq -r '.dependencies.postgres.status')
+          redis=$(echo "$response" | jq -r '.dependencies.redis.status')
+          migrations=$(echo "$response" | jq -r '.dependencies.migrations.status')
+          
+          echo "Overall status: $status"
+          echo "PostgreSQL: $postgres"
+          echo "Redis: $redis"
+          echo "Migrations: $migrations"
+          
+          if [[ "$status" != "healthy" ]]; then
+            echo "Dependencies check failed!"
+            exit 1
+          fi
+          
+          echo "deps_status=healthy" >> $GITHUB_OUTPUT
+          
+      - name: Test task creation (with mock API key)
+        id: task-test
+        if: steps.set-url.outputs.environment == 'staging'
+        run: |
+          # Note: This requires a test API key to be set up
+          # For now, we just check that the endpoint exists
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ steps.set-url.outputs.api_url }}/tasks" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer test_key" \
+            -d '{"type": "gen_content", "payload": {"prompt": "test"}}')
+          
+          http_code=$(echo "$response" | tail -n1)
+          
+          # We expect 401 without valid key, which still proves endpoint exists
+          if [[ "$http_code" == "401" ]] || [[ "$http_code" == "200" ]]; then
+            echo "Task endpoint is accessible"
+            echo "task_endpoint=accessible" >> $GITHUB_OUTPUT
+          else
+            echo "Unexpected response: $http_code"
+            exit 1
+          fi
+          
+      - name: Validate throughput metric
+        run: |
+          metrics=$(curl -s "${{ steps.set-url.outputs.api_url }}/metrics")
+          
+          # Extract throughput value
+          throughput=$(echo "$metrics" | grep "aurea_throughput_fph" | grep -v "#" | awk '{print $2}')
+          
+          echo "Current throughput: $throughput tasks/hour"
+          
+          # Check if throughput is a number
+          if ! [[ "$throughput" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Invalid throughput value!"
+            exit 1
+          fi
+          
+          # In production, alert if throughput is 0
+          if [[ "${{ steps.set-url.outputs.environment }}" == "production" ]] && (( $(echo "$throughput == 0" | bc -l) )); then
+            echo "Warning: Production throughput is 0!"
+            # Don't fail, just warn
+          fi
+          
+      - name: Generate validation report
+        if: always()
+        run: |
+          cat << EOF > validation_report.md
+          # Post-Deploy Validation Report
+          
+          **Environment**: ${{ steps.set-url.outputs.environment }}
+          **API URL**: ${{ steps.set-url.outputs.api_url }}
+          **Timestamp**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          ## Test Results
+          
+          | Check | Status |
+          |-------|--------|
+          | Health Endpoint | ${{ steps.health-check.outputs.health_status || 'failed' }} |
+          | Metrics Endpoint | ${{ steps.metrics-check.outputs.metrics_status || 'failed' }} |
+          | Dependencies | ${{ steps.deps-check.outputs.deps_status || 'failed' }} |
+          | Task Endpoint | ${{ steps.task-test.outputs.task_endpoint || 'not tested' }} |
+          
+          ## Next Steps
+          
+          $(if [[ "${{ job.status }}" == "success" ]]; then
+            echo "✅ All validation checks passed. System is ready for use."
+          else
+            echo "❌ Some validation checks failed. Please investigate before using the system."
+          fi)
+          EOF
+          
+          cat validation_report.md
+          
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: validation-report-${{ steps.set-url.outputs.environment }}
+          path: validation_report.md
+          
+      - name: Send notification on failure
+        if: failure()
+        run: |
+          # Add notification logic here (Slack, email, etc.)
+          echo "Validation failed for ${{ steps.set-url.outputs.environment }}!"
+          echo "Check the validation report for details."
+          
+  performance-baseline:
+    name: Establish Performance Baseline
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    if: success()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set environment URL
+        id: set-url
+        run: |
+          if [[ "${{ github.event.inputs.environment || 'staging' }}" == "production" ]]; then
+            echo "api_url=${{ env.PRODUCTION_URL }}" >> $GITHUB_OUTPUT
+          else
+            echo "api_url=${{ env.STAGING_URL }}" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Run performance test
+        run: |
+          # Simple load test to establish baseline
+          echo "Running basic load test..."
+          
+          # Use curl in parallel to simulate load
+          for i in {1..10}; do
+            curl -s "${{ steps.set-url.outputs.api_url }}/health" > /dev/null &
+          done
+          wait
+          
+          # Collect metrics after load
+          sleep 5
+          metrics=$(curl -s "${{ steps.set-url.outputs.api_url }}/metrics")
+          
+          # Extract key metrics
+          p95_latency=$(echo "$metrics" | grep 'aurea_task_duration_seconds{quantile="0.95"}' | awk '{print $2}')
+          error_rate=$(echo "$metrics" | grep "aurea_retry_rate" | grep -v "#" | awk '{print $2}')
+          
+          echo "Performance Baseline:"
+          echo "  P95 Latency: ${p95_latency:-N/A} seconds"
+          echo "  Error Rate: ${error_rate:-N/A}"
+          
+          # Store as artifacts for comparison
+          echo "$p95_latency" > p95_baseline.txt
+          echo "$error_rate" > error_baseline.txt
+          
+      - name: Upload performance baseline
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-baseline
+          path: |
+            p95_baseline.txt
+            error_baseline.txt

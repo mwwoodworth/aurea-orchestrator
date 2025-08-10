@@ -1,8 +1,8 @@
-# AUREA Orchestrator Operations Manual
+# AUREA Orchestrator Operations Manual v1.1
 
 ## Overview
 
-The AUREA Orchestrator is an always-on orchestration layer that manages cross-AI tasks, integrates with multiple services, and provides reliable task execution with retries, idempotency, and observability.
+The AUREA Orchestrator is a production-hardened, always-on orchestration layer that manages cross-AI tasks with enterprise-grade reliability, security, and observability. Version 1.1 introduces autoscaling, enhanced security, budget controls, and comprehensive monitoring.
 
 ## Environment Setup
 
@@ -12,8 +12,14 @@ The AUREA Orchestrator is an always-on orchestration layer that manages cross-AI
 # Core Configuration
 PORT=8000
 ENV=production
-API_KEY=your-secure-api-key
+ENVIRONMENT=production  # or staging
+LOG_LEVEL=INFO
+
+# Security
+API_KEY_SALT=your-salt-for-api-keys
 WEBHOOK_SECRET=your-webhook-secret
+JWT_SECRET=your-jwt-secret
+INTERNAL_KEY=your-internal-api-key
 
 # Redis
 REDIS_URL=redis://default:password@redis.upstash.io:6379
@@ -37,11 +43,22 @@ GOOGLE_API_KEY=your-google-key
 SENTRY_DSN=your-sentry-dsn
 OTEL_EXPORTER_OTLP_ENDPOINT=https://otel-collector.example.com
 
-# Rate Limits
-MAX_CONCURRENCY=8
+# Rate Limits & Controls
+MAX_CONCURRENCY=10
+WORKER_CONCURRENCY=10
+WORKER_REPLICAS=2
 TASK_LEASE_SECONDS=900
-TASK_MAX_RETRIES=6
-MODEL_DAILY_BUDGET_USD=25
+TASK_MAX_RETRIES=3
+TASK_BACKOFF_MAX_SEC=60
+
+# Budget Controls
+MODEL_DAILY_BUDGET_USD=100
+TASK_MAX_TOKENS=4000
+MAX_QUEUE_DEPTH=1000
+
+# Circuit Breaker
+CIRCUIT_BREAKER_THRESHOLD=0.1
+CIRCUIT_BREAKER_TIMEOUT=600
 ```
 
 ## Local Development
@@ -66,8 +83,13 @@ make install
 cp .env.example .env
 # Edit .env with your configuration
 
-# Run database migrations in Supabase SQL Editor
-# Copy contents of infra/migrations/001_create_orchestrator_tables.sql
+# Run database migrations
+psql $DATABASE_URL < migrations/001_initial.sql
+psql $DATABASE_URL < migrations/002_outbox_inbox.sql
+
+# Or in Supabase SQL Editor:
+# 1. Copy contents of migrations/001_initial.sql
+# 2. Copy contents of migrations/002_outbox_inbox.sql
 ```
 
 ### Running Locally
@@ -292,23 +314,88 @@ curl https://aurea-orchestrator-api.onrender.com/health
    - Monitor logs in Render
    - Verify health check: `curl https://your-service.onrender.com/health`
 
+## Production Deployment (v1.1+)
+
+### Staging to Production Cutover
+
+1. **Deploy to Staging:**
+   ```bash
+   # Set staging environment variables
+   render env:set --group staging
+   
+   # Deploy to staging
+   git push origin main
+   
+   # Wait for deployment
+   curl -f https://aurea-orchestrator-api-staging.onrender.com/health
+   ```
+
+2. **Run Smoke Tests:**
+   ```bash
+   # Trigger GitHub Action
+   gh workflow run post_deploy_validation.yml -f environment=staging
+   
+   # Or run locally
+   ./tests/smoke_test.sh staging
+   ```
+
+3. **Canary Deployment:**
+   ```bash
+   # Deploy 1 worker replica first
+   render service:update aurea-orchestrator-worker --num-instances 1
+   
+   # Monitor for 15 minutes
+   watch 'curl -s https://aurea-orchestrator-api.onrender.com/metrics | grep error_rate'
+   
+   # If stable, scale to full
+   render service:update aurea-orchestrator-worker --num-instances 2
+   ```
+
+4. **Promote to Production:**
+   ```bash
+   # Copy environment group
+   render env:copy --from staging --to production
+   
+   # Deploy production
+   render deploy --service aurea-orchestrator-api
+   render deploy --service aurea-orchestrator-worker
+   ```
+
 ## Rollback & Disaster Recovery
 
 ### Rollback Procedure
 
-1. **Identify Issue:**
+1. **Quick Rollback (< 5 minutes):**
    ```bash
-   # Check health
-   curl https://aurea-orchestrator-api.onrender.com/health
+   # Scale workers to zero immediately
+   render service:scale aurea-orchestrator-worker --count 0
    
-   # Check recent errors in Sentry
-   # Review logs in Render
+   # Rollback API
+   render deploy:rollback aurea-orchestrator-api
+   
+   # Rollback workers
+   render deploy:rollback aurea-orchestrator-worker
+   
+   # Scale workers back up
+   render service:scale aurea-orchestrator-worker --count 2
    ```
 
-2. **Rollback in Render:**
-   - Go to Render dashboard
-   - Select the service
-   - Click "Rollback" and select previous deployment
+2. **Full Rollback with Queue Drain:**
+   ```bash
+   # Stop workers
+   render service:scale aurea-orchestrator-worker --count 0
+   
+   # Drain queue to prevent task loss
+   python bin/dlq-drain.py drain --redis-url $REDIS_URL --dry-run
+   python bin/dlq-drain.py drain --redis-url $REDIS_URL --max 1000
+   
+   # Rollback services
+   render deploy:rollback aurea-orchestrator-api --to <deployment-id>
+   render deploy:rollback aurea-orchestrator-worker --to <deployment-id>
+   
+   # Restart workers
+   render service:scale aurea-orchestrator-worker --count 2
+   ```
 
 3. **Database Rollback (if needed):**
    ```sql
@@ -337,16 +424,102 @@ curl https://aurea-orchestrator-api.onrender.com/health
    # Scale back up
    ```
 
+## Operational Playbooks
+
+### Circuit Breaker Open
+
+**Symptoms:**
+- Metrics show `aurea_circuit_open_total > 0`
+- Tasks failing with `CircuitOpenError`
+
+**Resolution:**
+```bash
+# Check which service has open circuit
+curl -s $API_URL/metrics | grep circuit_open
+
+# Check circuit state in database
+psql $DATABASE_URL -c "SELECT * FROM orchestrator_circuit_breakers WHERE state = 'open'"
+
+# Manual reset if needed (after fixing root cause)
+psql $DATABASE_URL -c "UPDATE orchestrator_circuit_breakers SET state = 'closed', next_retry_at = NOW() WHERE service = 'SERVICE_NAME'"
+```
+
+### DLQ Growing
+
+**Symptoms:**
+- `aurea_dlq_total` increasing
+- Tasks failing after max retries
+
+**Resolution:**
+```bash
+# Check DLQ stats
+python bin/dlq-drain.py stats --redis-url $REDIS_URL
+
+# Investigate failures
+curl -s $API_URL/admin/runs?status=failed&limit=10 | jq '.[] | {task_id, type, error}'
+
+# Drain selectively after fixing issue
+python bin/dlq-drain.py drain --filter-type problematic_type --max 50
+```
+
+### Budget Exceeded
+
+**Symptoms:**
+- Tasks rejected with `BudgetExceededError`
+- `aurea_budget_remaining_usd` near 0
+
+**Resolution:**
+```bash
+# Check current spend
+curl -s $API_URL/metrics | grep budget
+
+# Emergency budget increase
+render env:set MODEL_DAILY_BUDGET_USD=150
+
+# Investigate high-cost tasks
+psql $DATABASE_URL -c "SELECT type, COUNT(*), AVG(model_cost_usd) FROM orchestrator_runs WHERE created_at > NOW() - INTERVAL '24 hours' GROUP BY type ORDER BY AVG(model_cost_usd) DESC"
+```
+
+### Webhook Replay Attack
+
+**Symptoms:**
+- `aurea_inbox_replay_blocked_total` increasing
+- Duplicate webhook attempts in logs
+
+**Resolution:**
+```bash
+# Check blocked webhooks
+psql $DATABASE_URL -c "SELECT source, external_id, COUNT(*) FROM orchestrator_inbox WHERE status = 'rejected' AND rejection_reason LIKE '%replay%' GROUP BY source, external_id"
+
+# Rotate webhook secret if compromised
+NEW_SECRET=$(openssl rand -hex 32)
+render env:set WEBHOOK_SECRET=$NEW_SECRET
+
+# Update webhook configuration in GitHub/ClickUp/Make
+```
+
 ## Budget Management
 
 ### Monitor AI Usage
 
 ```bash
-# Check current usage
-curl https://aurea-orchestrator-api.onrender.com/metrics | grep budget
+# Real-time budget status
+curl -s $API_URL/metrics | grep -E "budget_(spent|remaining)_usd"
 
-# Adjust budget
-# Update MODEL_DAILY_BUDGET_USD in environment variables
+# Historical analysis
+psql $DATABASE_URL << SQL
+SELECT 
+  date,
+  provider,
+  budget_usd,
+  spent_usd,
+  token_count,
+  request_count,
+  ROUND(spent_usd::numeric / NULLIF(request_count, 0), 4) as avg_cost_per_request
+FROM orchestrator_budgets
+WHERE date >= CURRENT_DATE - INTERVAL '7 days'
+ORDER BY date DESC, provider;
+SQL
 ```
 
 ### Safely Increase Budget
@@ -389,6 +562,61 @@ curl https://aurea-orchestrator-api.onrender.com/metrics | grep budget
      expr: aurea_budget_used_usd > 20
      for: 1m
    ```
+
+## Security Operations
+
+### API Key Management
+
+```bash
+# Create new API key
+python << EOF
+import asyncio
+import asyncpg
+from shared.security import APIKeyManager, UserRole
+
+async def create_key():
+    pool = await asyncpg.create_pool("$DATABASE_URL")
+    manager = APIKeyManager(pool, "$API_KEY_SALT")
+    key_id, raw_key = await manager.create_key(
+        name="production_service",
+        role=UserRole.SERVICE,
+        description="Production service key",
+        expires_in_days=90,
+        created_by="ops"
+    )
+    print(f"Key ID: {key_id}")
+    print(f"API Key: {raw_key}")
+    print("Save this key securely - it cannot be retrieved again!")
+    await pool.close()
+
+asyncio.run(create_key())
+EOF
+
+# Rotate API key
+python bin/rotate-api-key.py OLD_KEY_ID --overlap-minutes 60
+
+# List active keys
+psql $DATABASE_URL -c "SELECT id, name, role, created_at, last_used_at FROM orchestrator_api_keys WHERE is_active = true"
+
+# Revoke compromised key
+psql $DATABASE_URL -c "UPDATE orchestrator_api_keys SET is_active = false WHERE id = 'KEY_ID'"
+```
+
+### Webhook Secret Rotation
+
+```bash
+# Generate new secret
+NEW_SECRET=$(openssl rand -hex 32)
+echo "New webhook secret: $NEW_SECRET"
+
+# Update in Render (staged rollout)
+render env:set WEBHOOK_SECRET=$NEW_SECRET --service aurea-orchestrator-api
+
+# Update in external services:
+# - GitHub: Settings → Webhooks → Edit → Secret
+# - ClickUp: App Settings → Webhooks → Update
+# - Make: Scenario → Webhook module → Update
+```
 
 ## Troubleshooting
 
@@ -457,10 +685,108 @@ curl https://aurea-orchestrator-api.onrender.com/metrics | grep budget
 - Review and optimize slow queries
 - Capacity planning
 
+## Operational Scripts
+
+### Task Enqueue Helper
+
+```bash
+# Basic usage
+./bin/enqueue.sh gen_content -p '{"prompt": "Test content"}'
+
+# With priority and idempotency
+./bin/enqueue.sh code_pr -f request.json --priority high --idempotency pr-fix-123
+
+# Check result
+curl -s $API_URL/tasks/$TASK_ID | jq '.status'
+```
+
+### DLQ Management
+
+```bash
+# View DLQ statistics
+python bin/dlq-drain.py stats
+
+# Drain with dry run
+python bin/dlq-drain.py drain --dry-run --max 10
+
+# Drain specific task type
+python bin/dlq-drain.py drain --filter-type gen_content --max 50
+
+# Drain all with lower priority
+python bin/dlq-drain.py drain --max 1000
+```
+
+### API Key Rotation
+
+```bash
+# Automated rotation
+python bin/rotate-api-key.py $OLD_KEY_ID --overlap-minutes 60
+
+# Manual rotation
+# 1. Create new key
+# 2. Update services to use new key
+# 3. Wait for overlap period
+# 4. Revoke old key
+```
+
+## Monitoring Dashboards
+
+### Grafana Configuration
+
+```yaml
+# Import these queries for key metrics
+
+# Task Processing Rate
+rate(aurea_tasks_total[5m])
+
+# Error Rate
+rate(aurea_tasks_total{status="failed"}[5m]) / rate(aurea_tasks_total[5m])
+
+# P95 Latency
+aurea_task_duration_seconds{quantile="0.95"}
+
+# Budget Utilization
+aurea_budget_spent_usd / 100
+
+# Queue Depth
+aurea_queue_depth
+
+# Circuit Breaker Status
+aurea_circuit_open_total
+```
+
 ## Support
 
 For issues or questions:
-- Check logs in Render dashboard
-- Review Sentry for errors
-- Consult this operations manual
-- Contact the development team
+1. Check health: `curl $API_URL/health`
+2. Review metrics: `curl $API_URL/metrics`
+3. Check logs in Render dashboard
+4. Review Sentry for errors
+5. Run diagnostics: `curl $API_URL/internal/health/deps`
+6. Consult this operations manual
+7. Contact the development team
+
+## Appendix: Quick Commands
+
+```bash
+# Health check
+curl -f $API_URL/health
+
+# Dependencies check
+curl $API_URL/internal/health/deps | jq
+
+# Current metrics
+curl -s $API_URL/metrics | grep -E "(queue_depth|throughput|error_rate|budget)"
+
+# Recent failures
+curl -H "Authorization: Bearer $API_KEY" $API_URL/admin/runs?status=failed&limit=5 | jq
+
+# Queue stats
+curl -s $API_URL/metrics | grep -E "(queue|dlq|pending)"
+
+# Budget status
+curl -s $API_URL/metrics | grep budget
+
+# Circuit breaker status
+curl -s $API_URL/metrics | grep circuit
+```
