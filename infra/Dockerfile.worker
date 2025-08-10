@@ -1,35 +1,55 @@
-# AUREA Orchestrator Worker Dockerfile
+# Production-optimized AUREA Orchestrator Worker Dockerfile
+FROM python:3.11-slim AS builder
+
+# Build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Production image
 FROM python:3.11-slim
 
-# Set working directory
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
+# Runtime dependencies (including Node.js for CenterPoint scripts)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     nodejs \
     npm \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install tsx for TypeScript execution (for CenterPoint sync)
+# Install tsx globally for TypeScript execution
 RUN npm install -g tsx
 
-# Create non-root user
-RUN useradd -m -u 1000 aurea && chown -R aurea:aurea /app
+# Create non-root user with proper permissions
+RUN useradd -m -u 1000 aurea && \
+    mkdir -p /app /tmp/locks && \
+    chown -R aurea:aurea /app /tmp/locks
 
-# Copy requirements
-COPY --chown=aurea:aurea requirements.txt .
+WORKDIR /app
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy Python packages from builder
+COPY --from=builder --chown=aurea:aurea /root/.local /home/aurea/.local
 
 # Copy application code
 COPY --chown=aurea:aurea orchestrator orchestrator
 COPY --chown=aurea:aurea shared shared
+COPY --chown=aurea:aurea migrations migrations
+COPY --chown=aurea:aurea bin bin
 
-# Switch to non-root user
+# Environment optimizations
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH=/home/aurea/.local/bin:$PATH \
+    WORKER_LOCK_DIR=/tmp/locks
+
 USER aurea
 
-# Start worker
-CMD ["python", "-m", "orchestrator.worker"]
+# Add file lock to prevent duplicate processes
+ENTRYPOINT ["sh", "-c", "exec flock -n /tmp/locks/worker.lock python -m orchestrator.worker"]

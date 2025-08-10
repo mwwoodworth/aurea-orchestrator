@@ -1,16 +1,35 @@
-# Render deployment configuration
+# Render deployment configuration for AUREA Orchestrator v1.1
+# Production-hardened with autoscaling, health checks, and reliability
 services:
-  # Web Service (FastAPI)
+  # Web Service (FastAPI) with autoscaling and health monitoring
   - type: web
     name: aurea-orchestrator-api
     runtime: docker
     dockerfilePath: ./infra/Dockerfile.api
     dockerContext: .
+    plan: standard  # At least 1GB RAM
+    autoDeploy: true
+    healthCheckPath: /health
+    numInstances: 1  # Can scale to 3
+    scaling:
+      minInstances: 1
+      maxInstances: 3
+      targetMemoryPercent: 75
+      targetCPUPercent: 70
     envVars:
+      - fromGroup: production
       - key: ENV
         value: production
       - key: PORT
         value: 8000
+      - key: HEALTHCHECK_PATH
+        value: /health
+      - key: HEALTHCHECK_TIMEOUT
+        value: 5s
+      - key: HEALTHCHECK_INTERVAL
+        value: 10s
+      - key: WORKER_COUNT
+        value: "2"
       - key: SENTRY_DSN
         sync: false
       - key: REDIS_URL
@@ -47,21 +66,27 @@ services:
         sync: false
       - key: MRG_PRODUCTION_WEBHOOK
         value: https://api.render.com/deploy/srv-d1tfs4idbo4c73di6k00?key=t2qc-8j6xrM
-    healthCheckPath: /health
-    autoDeploy: true
-    plan: standard
 
-  # Background Worker
+  # Background Worker with replicas and restart policy
   - type: worker
     name: aurea-orchestrator-worker
     runtime: docker
     dockerfilePath: ./infra/Dockerfile.worker
     dockerContext: .
+    plan: standard  # At least 1GB RAM
+    numInstances: 2  # Active-passive via queue leases
+    autoDeploy: true
+    restartPolicy: always
     envVars:
+      - fromGroup: production
       - key: ENV
         value: production
       - key: WORKER_ID
-        value: aurea-worker-prod-01
+        generateValue: true  # Unique per instance
+      - key: WORKER_CONCURRENCY
+        value: "10"
+      - key: WORKER_REPLICAS
+        value: "2"
       - key: SENTRY_DSN
         sync: false
       - key: REDIS_URL
@@ -102,25 +127,83 @@ services:
         sync: false
       - key: CENTERPOINT_TENANT_ID
         sync: false
-    autoDeploy: true
-    plan: standard
-    
-  # Cron Job for maintenance
+
+  # Nightly maintenance cron
   - type: cron
     name: aurea-orchestrator-maintenance
     schedule: "0 2 * * *"  # Daily at 2 AM UTC
-    buildCommand: "pip install httpx"
-    startCommand: |
-      python -c "
-      import httpx
-      import os
-      
-      response = httpx.post(
-          f\"https://aurea-orchestrator-api.onrender.com/internal/maintenance\",
-          headers={'X-Internal-Key': os.getenv('INTERNAL_KEY')}
-      )
-      print(f'Maintenance task: {response.status_code}')
-      "
+    runtime: docker
+    dockerfilePath: ./infra/Dockerfile.worker
+    dockerContext: .
+    buildCommand: "echo 'Using Docker image'"
+    startCommand: "python -m orchestrator.cron maintenance"
     envVars:
+      - fromGroup: production
+      - key: MAINTENANCE_ENDPOINT
+        value: https://aurea-orchestrator-api.onrender.com/internal/maintenance
       - key: INTERNAL_KEY
         sync: false
+
+  # Hourly stats snapshot cron
+  - type: cron
+    name: aurea-orchestrator-stats
+    schedule: "0 * * * *"  # Every hour
+    runtime: docker
+    dockerfilePath: ./infra/Dockerfile.worker
+    dockerContext: .
+    buildCommand: "echo 'Using Docker image'"
+    startCommand: "python -m orchestrator.cron stats"
+    envVars:
+      - fromGroup: production
+      - key: STATS_ENDPOINT
+        value: https://aurea-orchestrator-api.onrender.com/internal/stats/snapshot
+      - key: INTERNAL_KEY
+        sync: false
+
+# Environment Variable Groups
+envVarGroups:
+  - name: staging
+    envVars:
+      - key: ENVIRONMENT
+        value: staging
+      - key: LOG_LEVEL
+        value: DEBUG
+      - key: SENTRY_DSN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: API_KEY_SALT
+        generateValue: true
+      - key: MAX_QUEUE_DEPTH
+        value: "500"
+      - key: TASK_MAX_RETRIES
+        value: "3"
+
+  - name: production
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: SENTRY_DSN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: API_KEY_SALT
+        generateValue: true
+      - key: MODEL_DAILY_BUDGET_USD
+        value: "100"
+      - key: TASK_MAX_TOKENS
+        value: "4000"
+      - key: MAX_QUEUE_DEPTH
+        value: "1000"
+      - key: TASK_MAX_RETRIES
+        value: "3"
+      - key: CIRCUIT_BREAKER_THRESHOLD
+        value: "0.1"
+      - key: CIRCUIT_BREAKER_TIMEOUT
+        value: "600"

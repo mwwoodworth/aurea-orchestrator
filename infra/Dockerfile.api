@@ -1,37 +1,55 @@
-# AUREA Orchestrator API Dockerfile
+# Production-optimized AUREA Orchestrator API Dockerfile
+FROM python:3.11-slim AS builder
+
+# Build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Production image
 FROM python:3.11-slim
 
-# Set working directory
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
+# Runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN useradd -m -u 1000 aurea && chown -R aurea:aurea /app
+RUN useradd -m -u 1000 aurea && \
+    mkdir -p /app && \
+    chown -R aurea:aurea /app
 
-# Copy requirements
-COPY --chown=aurea:aurea requirements.txt .
+WORKDIR /app
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy Python packages from builder
+COPY --from=builder --chown=aurea:aurea /root/.local /home/aurea/.local
 
 # Copy application code
 COPY --chown=aurea:aurea app app
 COPY --chown=aurea:aurea shared shared
+COPY --chown=aurea:aurea migrations migrations
 
-# Switch to non-root user
+# Environment optimizations
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH=/home/aurea/.local/bin:$PATH \
+    PORT=8000
+
 USER aurea
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+# Health check with proper intervals for production
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:${PORT}/health || exit 1
 
 # Expose port
-EXPOSE ${PORT:-8000}
+EXPOSE ${PORT}
 
-# Start application
-CMD ["python", "-m", "uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "${PORT:-8000}"]
+# Start with multiple workers for production
+CMD ["sh", "-c", "uvicorn app.api.main:app --host 0.0.0.0 --port ${PORT} --workers ${WORKER_COUNT:-2} --loop uvloop"]
